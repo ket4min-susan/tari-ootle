@@ -211,16 +211,13 @@ impl<TAddr: NodeAddressable + ToPeerId, TMsg: MessageSpec> ValidatorNodeRpcClien
         transaction: Transaction,
     ) -> Result<TransactionId, ValidatorNodeRpcClientError> {
         let mut client = self.client_connection().await?;
+        let expected_id = transaction.calculate_id();
         let request = SubmitTransactionRequest {
             transaction: Some((&transaction).into()),
         };
         let response = client.submit_transaction(request).await?;
 
-        let id = response.transaction_id.try_into().map_err(|_| {
-            ValidatorNodeRpcClientError::InvalidResponse(anyhow!("Node returned an invalid or empty transaction id"))
-        })?;
-
-        Ok(id)
+        decode_submitted_transaction_id(response.transaction_id, &expected_id)
     }
 
     async fn get_finalized_transaction_result(
@@ -282,7 +279,7 @@ impl<TAddr: NodeAddressable + ToPeerId, TMsg: MessageSpec> ValidatorNodeRpcClien
             include_proof: false,
         };
 
-        let resp = client.get_substate(request).await?;
+        let mut resp = client.get_substate(request).await?;
         let status = SubstateStatus::try_from(resp.status).map_err(|e| {
             ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
                 "Node returned invalid substate status {}: {e}",
@@ -295,15 +292,7 @@ impl<TAddr: NodeAddressable + ToPeerId, TMsg: MessageSpec> ValidatorNodeRpcClien
         //     let qc = QuorumCertificate::try_from(&qc)?;
         // }
 
-        match status {
-            SubstateStatus::Up => Ok(SubstateResult::Up {
-                substate: EncodedSubstate::new(resp.version, Encoded::from_bytes(resp.substate)),
-            }),
-            SubstateStatus::Down => Ok(SubstateResult::Down {
-                version: SubstateVersion::new(resp.version),
-            }),
-            SubstateStatus::DoesNotExist => Ok(SubstateResult::DoesNotExist),
-        }
+        decode_single_substate_result(status, substate_req, &mut resp)
     }
 
     async fn get_substate_with_proof(
@@ -326,16 +315,7 @@ impl<TAddr: NodeAddressable + ToPeerId, TMsg: MessageSpec> ValidatorNodeRpcClien
         })?;
 
         let proof = decode_substate_proof(status, &mut resp);
-
-        let result = match status {
-            SubstateStatus::Up => SubstateResult::Up {
-                substate: EncodedSubstate::new(resp.version, Encoded::from_bytes(std::mem::take(&mut resp.substate))),
-            },
-            SubstateStatus::Down => SubstateResult::Down {
-                version: SubstateVersion::new(resp.version),
-            },
-            SubstateStatus::DoesNotExist => SubstateResult::DoesNotExist,
-        };
+        let result = decode_single_substate_result(status, substate_req, &mut resp)?;
 
         Ok((result, proof))
     }
@@ -422,6 +402,11 @@ where
         };
         match response {
             batch_response::Response::CommitProof(commit_proof) => {
+                if commit_proof.is_empty() {
+                    return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
+                        "Node sent an empty commit proof"
+                    )));
+                }
                 if batch.commit_proof.is_some() {
                     return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
                         "Node sent more than one commit proof"
@@ -448,14 +433,64 @@ where
     // Every requested id is either answered or named as missing. A responder that accounts for
     // none of them is not answering, and failing here keeps that from reading as "none of these
     // substates exist".
-    if batch.substates.is_empty() && batch.missing.is_empty() {
+    if !requested.is_empty() && batch.substates.is_empty() && batch.missing.is_empty() {
         return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
             "Node accounted for none of the {} requested substates",
-            substate_ids.len()
+            requested.len()
         )));
     }
 
     Ok(batch)
+}
+
+fn decode_submitted_transaction_id(
+    raw_id: Vec<u8>,
+    expected_id: &TransactionId,
+) -> Result<TransactionId, ValidatorNodeRpcClientError> {
+    let id: TransactionId = raw_id.try_into().map_err(|_| {
+        ValidatorNodeRpcClientError::InvalidResponse(anyhow!("Node returned an invalid or empty transaction id"))
+    })?;
+    if id != *expected_id {
+        return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
+            "Node returned transaction id {id} that does not match submitted transaction {expected_id}"
+        )));
+    }
+    Ok(id)
+}
+
+fn decode_single_substate_result(
+    status: SubstateStatus,
+    substate_req: SubstateRequirementRef<'_>,
+    resp: &mut GetSubstateResponse,
+) -> Result<SubstateResult, ValidatorNodeRpcClientError> {
+    if matches!(status, SubstateStatus::Up | SubstateStatus::Down) && !resp.address.is_empty() {
+        let answered_id = SubstateId::from_bytes(&resp.address)
+            .map_err(|e| ValidatorNodeRpcClientError::InvalidResponse(anyhow!("{e}")))?;
+        if answered_id != *substate_req.substate_id() {
+            return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
+                "Node answered for {answered_id} instead of requested {}",
+                substate_req.substate_id()
+            )));
+        }
+    }
+
+    match status {
+        SubstateStatus::Up => {
+            if resp.substate.is_empty() {
+                return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
+                    "Node returned an up substate for {} with an empty value",
+                    substate_req.substate_id()
+                )));
+            }
+            Ok(SubstateResult::Up {
+                substate: EncodedSubstate::new(resp.version, Encoded::from_bytes(std::mem::take(&mut resp.substate))),
+            })
+        },
+        SubstateStatus::Down => Ok(SubstateResult::Down {
+            version: SubstateVersion::new(resp.version),
+        }),
+        SubstateStatus::DoesNotExist => Ok(SubstateResult::DoesNotExist),
+    }
 }
 
 /// The proof a single-substate response carries, taken out of `resp`. The responder omits the commit proof when it has
@@ -487,6 +522,11 @@ fn decode_batched_substate(proven: proto::rpc::ProvenSubstate) -> Result<Batched
             version: SubstateVersion::new(substate.version),
         }
     } else {
+        if substate.substate.is_empty() {
+            return Err(ValidatorNodeRpcClientError::InvalidResponse(anyhow!(
+                "Node returned an up substate for {substate_id} with an empty value"
+            )));
+        }
         SubstateResult::Up {
             substate: EncodedSubstate::new(substate.version, Encoded::from_bytes(substate.substate)),
         }
@@ -797,5 +837,80 @@ mod tests {
         });
         let batched = decode_batched_substate(destroyed).unwrap();
         assert!(matches!(batched.result, SubstateResult::Down { .. }));
+    }
+
+    #[test]
+    fn decode_submitted_transaction_id_rejects_mismatched_id() {
+        let expected = TransactionId::new([1u8; 32]);
+        assert_eq!(
+            decode_submitted_transaction_id(expected.as_bytes().to_vec(), &expected).unwrap(),
+            expected
+        );
+        let mismatched = TransactionId::new([2u8; 32]);
+        let err = decode_submitted_transaction_id(mismatched.as_bytes().to_vec(), &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match submitted transaction"), "{err}");
+    }
+
+    #[test]
+    fn up_substate_responses_reject_empty_value_or_mismatched_address() {
+        let id = substate_id();
+        let other = other_substate_id();
+        let req = SubstateRequirementRef::new(&id, None);
+
+        let mut empty_up = over_the_wire(&GetSubstateResponse {
+            status: SubstateStatus::Up as i32,
+            address: id.to_bytes(),
+            substate: vec![],
+            ..Default::default()
+        });
+        let err = decode_single_substate_result(SubstateStatus::Up, req, &mut empty_up)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty value"), "{err}");
+
+        let mut wrong_addr = over_the_wire(&GetSubstateResponse {
+            status: SubstateStatus::Up as i32,
+            address: other.to_bytes(),
+            substate: vec![1, 2, 3],
+            ..Default::default()
+        });
+        let err = decode_single_substate_result(SubstateStatus::Up, req, &mut wrong_addr)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instead of requested"), "{err}");
+
+        let empty_batched = over_the_wire(&proto::rpc::ProvenSubstate {
+            substate: Some(proto::consensus::Substate {
+                substate_id: id.to_bytes(),
+                version: 0,
+                substate: vec![],
+                created: None,
+                destroyed: None,
+            }),
+            substate_value_proof: vec![],
+            proof_epoch: 0,
+        });
+        let err = decode_batched_substate(empty_batched).unwrap_err().to_string();
+        assert!(err.contains("empty value"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_commit_proof_and_accepts_empty_request() {
+        let id = substate_id();
+        let rejection = rejection_of(
+            vec![
+                frame(batch_response::Response::CommitProof(vec![])),
+                missing_frame(&[&id]),
+            ],
+            &[&id],
+        )
+        .await;
+        assert!(rejection.contains("empty commit proof"), "{rejection}");
+
+        let empty_batch = collect(vec![], &[]).await.unwrap();
+        assert!(empty_batch.substates.is_empty());
+        assert!(empty_batch.missing.is_empty());
     }
 }
